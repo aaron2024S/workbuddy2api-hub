@@ -1,0 +1,57 @@
+name: docker-build-push
+
+# 手动触发：Actions 页 → 左侧选本 workflow → 右上 Run workflow
+# 镜像会推到 Docker Hub 的 <DOCKERHUB_USERNAME>/workbuddy2api-hub
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '镜像标签（默认 latest，可填 1.5.5 这类版本号）'
+        required: false
+        default: 'latest'
+        type: string
+
+env:
+  IMAGE_NAME: workbuddy2api-hub
+
+jobs:
+  docker:
+    runs-on: ubuntu-latest
+    env:
+      DOCKERHUB_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+    steps:
+      - name: 拉取代码
+        uses: actions/checkout@v6
+
+      - name: 准备 QEMU（用于构建 arm64）
+        uses: docker/setup-qemu-action@v4
+
+      - name: 准备 Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: 登录 Docker Hub
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: 构建并推送（amd64 + arm64）
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ env.DOCKERHUB_USER }}/${{ env.IMAGE_NAME }}:${{ inputs.tag || 'latest' }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: 结果汇总
+        run: |
+          echo "### 镜像已推送到 Docker Hub" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "- 名称：\`$DOCKERHUB_USER/$IMAGE_NAME:${{ inputs.tag || 'latest' }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- 摘要：\`${{ steps.build.outputs.digest }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- 架构：linux/amd64、linux/arm64" >> "$GITHUB_STEP_SUMMARY"
+          echo "- 拉取：\`docker pull $DOCKERHUB_USER/$IMAGE_NAME:${{ inputs.tag || 'latest' }}\`" >> "$GITHUB_STEP_SUMMARY"
