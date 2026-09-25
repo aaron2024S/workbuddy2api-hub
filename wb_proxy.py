@@ -1331,10 +1331,11 @@ def runtime_settings_view():
         "api_key_masked": masked,
         "auth_required": auth_required(),
         "api_keys": keys,
+        "reserve_credits": wb_settings.reserve_credits(ACCOUNTS_DIR),
         "accounts_dir": ACCOUNTS_DIR,
         "usage_dir": USAGE_DIR,
         "settings_file": wb_settings.settings_path(ACCOUNTS_DIR),
-        "version": "1.5.5",
+        "version": "1.5.7",
     }
 def current_account():
     """Account used for display purposes (health / usage summaries)."""
@@ -2146,16 +2147,31 @@ def normalize_tool_choice(obj):
     if isinstance(tc, str):
         val = tc.strip().lower()
         if val == "none":
-            obj.pop("tool_choice", None)
-            obj.pop("tools", None)
-            obj.pop("functions", None)
+            # 这里曾经把 tools/functions 一起删掉，那正是 Agent 死循环的成因：
+            # 工具声明没了，模型拿不到函数签名、又没有结构化工具通道，却仍被要求
+            # 完成任务，于是把调用降级成 DSML / 伪 JSON 文本塞进 content
+            # （tool_calls 为空、finish_reason=stop）。客户端解析不到调用只能再
+            # 追问一轮，模型又重复一遍 "I'll do it"，上下文每轮 +2 条消息、token
+            # 线性膨胀，直到撑爆窗口或用户手动断开。
+            #
+            # tool_choice="none" 的语义是「本轮不许调用工具」，这层意思由
+            # tool_choice 字段本身表达就够了，不需要抹掉能力声明。
+            # 上游把 tool_choice 声明为 string（发对象会 11101），所以保持字符串
+            # 原样透传，同时保留 tools。
+            #
+            # 取舍：实测本上游并不真正遵守 tool_choice="none"（保留 tools 后它
+            # 仍返回 tool_calls）。但对比两条路 —— 删 tools 会让模型输出不可解析
+            # 的文本、Agent 原地空转；留 tools 则走正常 tool_calls 通道，客户端能
+            # 正常执行与回填 —— 后者明显更好。确实需要禁止调用时，客户端不传
+            # tools 即可。
+            obj["tool_choice"] = "none"
         return
     if isinstance(tc, dict):
         typ = (tc.get("type") or "").strip().lower()
         if typ == "none":
-            obj.pop("tool_choice", None)
-            obj.pop("tools", None)
-            obj.pop("functions", None)
+            # 同上：保留 tools 声明。上游只认字符串，对象形式必须降级成
+            # "none"，否则 11101。
+            obj["tool_choice"] = "none"
         elif typ in ("auto", "required"):
             obj["tool_choice"] = typ
         elif typ == "function":
@@ -4101,7 +4117,7 @@ class Handler(BaseHTTPRequestHandler):
             super().finish()
         except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError):
             pass
-    server_version = "wb-proxy/1.5.5"
+    server_version = "wb-proxy/1.5.7"
     def log_message(self, fmt, *args):
         # 静默过滤前端看板高频定时心跳的正常 200 GET 请求（/logs、/usage、/accounts 轮询等）
         # 避免自增死循环刷屏与日志污染。遇 4xx/5xx 异常或所有非 GET 业务操作依然如实记录。
@@ -4905,6 +4921,19 @@ class Handler(BaseHTTPRequestHandler):
         if "auth_disabled" in payload:
             wb_settings.set_auth_disabled(ACCOUNTS_DIR, payload.get("auth_disabled"))
             reply["auth_disabled"] = bool(payload.get("auth_disabled"))
+        if "reserve_credits" in payload:
+            try:
+                reserve = int(payload.get("reserve_credits"))
+            except (TypeError, ValueError):
+                return self._error(400, "reserve_credits must be a whole number",
+                                   "invalid_request_error")
+            if reserve < 0:
+                return self._error(400, "reserve_credits cannot be negative",
+                                   "invalid_request_error")
+            wb_settings.set_reserve_credits(ACCOUNTS_DIR, reserve)
+            if POOL:
+                POOL.apply_reserve_credits(reserve)
+            reply["reserve_credits"] = reserve
         new_key = payload.get("api_key")
         if new_key is not None:
             new_key = str(new_key).strip()
@@ -5956,6 +5985,7 @@ def _bootstrap_runtime(args):
     POOL = wb_accounts.AccountPool(ACCOUNTS_DIR, log=log)
     POOL.load()
     POOL.apply_proxy_slots()
+    POOL.apply_reserve_credits()
     load_persisted_realm()
     global SCHEDULER
     from wb_scheduler import Scheduler

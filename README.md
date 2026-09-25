@@ -1,7 +1,7 @@
 # WorkBuddy2API-Hub — 国际版、国内版多账号网关中枢
 
 <p align="center">
-  <a href="https://github.com/ardeyouxipianyi/workbuddy2api-hub/releases"><img src="https://img.shields.io/badge/Release-v1.5.5-2496ED?style=flat-square" alt="Version 1.5.5"></a>
+  <a href="https://github.com/ardeyouxipianyi/workbuddy2api-hub/releases"><img src="https://img.shields.io/badge/Release-v1.5.7-2496ED?style=flat-square" alt="Version 1.5.7"></a>
   <img src="https://img.shields.io/badge/Python-3.9+-blue.svg?style=flat-square" alt="Python">
   <img src="https://img.shields.io/badge/API-OpenAI_Compatible-412991?style=flat-square" alt="OpenAI API">
   <img src="https://img.shields.io/badge/Dual_Realm-Intl_&_CN-0DBD8B?style=flat-square" alt="Dual Realm">
@@ -112,6 +112,29 @@ docker run -d   --name wb-proxy   --restart unless-stopped   -p 8788:8788   -v $
 - **持久化目录**：`./accounts` (账号凭证及活动区域) 与 `./usage` (请求流水与指标快照)；
 - **配置参数**：通过环境变量 `API_KEY`、`PORT` 自定义。
 
+#### Linux 桌面客户端凭据扫描
+
+Linux 版 WorkBuddy 的登录凭据通常位于：
+
+```text
+~/.local/share/CodeBuddyExtension/Data/Public/auth
+```
+
+目录内被识别的是两个文件：`workbuddy-desktop-ai.info`（国际版）与 `workbuddy-desktop.info`（国内版），文件名不匹配时看板会显示未检测到凭据。
+
+Docker 容器默认无法访问宿主机目录。Linux 用户可以复制示例配置：
+
+```bash
+cp docker-compose.override.yml.example docker-compose.override.yml
+docker compose up -d
+```
+
+若使用上面的 `docker run` 方式启动，追加参数 `-v "$HOME/.local/share/CodeBuddyExtension/Data/Public/auth:/root/.local/share/CodeBuddyExtension/Data/Public/auth:ro"` 即可。
+
+示例配置以只读方式挂载凭据目录，扫描过程只读取文件，不修改也不复制。在看板「设置」里确认导入后，凭据会被解析成账号并写入宿主机的 `./accounts`，这是导入的正常行为。容器因此等同于持有你的桌面登录态，公开部署时请务必设置 `API_KEY`。
+
+示例配置用 `${HOME}` 展开宿主机家目录，适用于会导出 `HOME` 的 shell（Linux / macOS）。Windows PowerShell 下 `HOME` 通常为空，会得到无效路径，请改用本机版启动脚本。
+
 ---
 
 ## 二、核心特性详解
@@ -166,6 +189,14 @@ docker run -d   --name wb-proxy   --restart unless-stopped   -p 8788:8788   -v $
 2. 弹窗只读展示本机检测到的桌面客户端账号（昵称、区域、域名、有效期）；
 3. 确认无误后点击该行对应的 **「导入」** 按钮，国际版账号自动归入国际版列表，国内版账号自动归入国内版列表。
 
+### 方式三：设置保留积分（避免余额被用尽）
+看板「设置 → 保留积分」可设定一个最低余额，账号剩余积分低于该值时不再接单，账号行会显示「保留积分」标记。
+
+- 上游在余额耗尽后会给账号发提醒短信，设一个阈值即可避免余额被用到 0；
+- 填 `0` 表示关闭，这是默认值；
+- 判定依据是最近一次查询到的余额（看板「积分」列），从未查询过余额的账号不受影响；
+- 账号只是停止接单，仍留在池中并继续定时任务（签到与猫猫旅行本身是赚积分），充值后自动恢复可用。
+
 ---
 
 ## 四、客户端配置与接入
@@ -205,6 +236,15 @@ export OPENAI_API_KEY="你在看板设置中添加并绑定的API_Key"
 ---
 
 ## 六、版本更新记录 (Changelog)
+
+### v1.5.7
+
+- **`tool_choice="none"` 不再删除工具声明**（PR #57，感谢 [@zhangzm0](https://github.com/zhangzm0)，issue #56）：此前客户端发 `tool_choice="none"` 时，`normalize_tool_choice()` 会把 `tools` / `functions` 声明整个删掉。模型失去结构化工具通道后，把调用降级成 DSML／伪 JSON 文本塞进 `content`（`tool_calls` 为空、`finish_reason=stop`），Agent 客户端解析不到调用只能再追问一轮，模型重复一遍 —— 上下文每轮 +2 条消息、token 线性膨胀，直到撑爆窗口或用户手动断开。现在保留工具声明，由 `tool_choice` 字段自己表达「本轮不许调用」；上游只认字符串，对象形式仍降级成字符串（发对象会 11101）。实测上游并不真正遵守 `tool_choice="none"`，保留声明后它仍可能返回 `tool_calls`——这比让 Agent 原地空转好；确实需要禁止调用时，请由客户端不传 `tools`。
+
+### v1.5.6
+
+- **Docker 部署下的 Linux 桌面凭据挂载**（PR #55，感谢 [@LuFering](https://github.com/LuFering)）：新增 `docker-compose.override.yml.example`，以只读方式把宿主机 `~/.local/share/CodeBuddyExtension/Data/Public/auth` 挂进容器，补上 Linux + Docker 场景下看板扫描不到桌面凭据的说明；`.gitignore` 同时忽略本地 `docker-compose.override.yml`。
+- **保留积分开关**（issue #44）：看板「设置」新增最低保留积分，账号余额低于该值时不再接单，避免余额被用尽后触发上游的提醒短信。填 `0` 关闭（默认）；从未查询过余额的账号不受影响；账号只是停止接单，仍在池中并继续定时任务，充值后自动恢复。阈值保存在 `accounts/settings.json` 的 `reserve_credits`，改动即时生效、无需重启。
 
 ### v1.5.5
 
