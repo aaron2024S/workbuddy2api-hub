@@ -481,11 +481,15 @@ a:hover{text-decoration:underline}
     <div class="toolbar">
     <button onclick="openLoginModal()">+ 添加账号 (OAuth)</button>
     <button class="sec" id="btnCheckin" onclick="doCheckin(this)" style="display:none">每日签到 (国内版)</button>
-    <button class="sec" id="btnScanDesktop" onclick="scanDesktop(this)">扫描桌面客户端账号</button>
+    <button class="sec" id="btnDailyChat" onclick="doDailyChat(this)" style="display:none">每日活跃打卡 (国际版)</button>
+    <!-- 入口暂时隐藏：桌面客户端自 2026-09-24 起把 token 改成加密存储（$wbEncrypted
+         信封），扫描导入只会得到一串无法使用的信封文本，之后每个请求都 401。等解密
+         打通或改走 OAuth 之后再放出来。scanDesktop() 与后端接口都保留未删。 -->
+    <!-- <button class="sec" id="btnScanDesktop" onclick="scanDesktop(this)">扫描桌面客户端账号</button> -->
     <button class="sec" onclick="exportAccounts(this)">导出账号</button>
     <button class="sec" onclick="openImport()">导入账号</button>
     <button class="sec" onclick="fetchCredits(this)">刷新积分</button>
-    <button class="sec" onclick="autoAssignSlots()">一键自动分配出口</button>
+    <button class="sec" onclick="autoAssignSlots()" title="把尚未绑定出口的已启用账号依次分配到已启用的代理槽；已有绑定的账号不受影响">分配代理出口给未绑定账号</button>
     <button class="sec" onclick="setAll(true, this)">全部启用</button>
     <button class="sec" onclick="setAll(false, this)">全部停用</button>
     
@@ -1054,6 +1058,8 @@ function updateUI(){
 
   const btnCheckin = document.getElementById("btnCheckin");
   if(btnCheckin) btnCheckin.style.display = (window.VIEW_REALM === "cn" ? "inline-block" : "none");
+  const btnDailyChat = document.getElementById("btnDailyChat");
+  if(btnDailyChat) btnDailyChat.style.display = (window.VIEW_REALM === "intl" ? "inline-block" : "none");
 
   // 计算当前绑定与生效的 Key 数量
   const keys = (typeof API_KEY_ROWS !== 'undefined' && API_KEY_ROWS.length) ? API_KEY_ROWS : (window.API_KEY_ROWS || []);
@@ -1121,11 +1127,23 @@ async function toggleActiveGatewayRealm(){
   }
 };
 
-async function initRealm(){
+async function refreshActiveRealm(){
+  // Refresh which exit the gateway is switched to. Deliberately does NOT touch
+  // VIEW_REALM: the view is the user's choice, and an account action taken from
+  // one realm's view must not throw them into the other one. Boot-time view
+  // selection (including the ?view= parameter) lives in initRealm().
   try {
     const r = await getJSON("/realm");
     if(r && r.current) window.ACTIVE_GATEWAY_REALM = r.current;
   } catch(e){}
+}
+
+async function initRealm(){
+  // Boot only - the initial view follows the active exit unless the URL pins it.
+  // Account actions call refreshActiveRealm() instead: reading ?view= here was
+  // what moved the panel back to the other realm after 签到 / 活跃打卡, because
+  // the view buttons do not rewrite the URL.
+  await refreshActiveRealm();
   window.VIEW_REALM = window.ACTIVE_GATEWAY_REALM;
   const viewFromUrl = new URLSearchParams(window.location.search).get('view');
   if(viewFromUrl && ['intl', 'cn'].includes(viewFromUrl)) window.VIEW_REALM = viewFromUrl;
@@ -1432,8 +1450,23 @@ async function doCheckin(btn){
       const summary = res.map(x => (x.nickname||x.uid.slice(0,6)) + ": " + (x.ok ? "签到成功" : (x.error||x.msg))).join("；");
       toast("每日签到: " + summary, res.some(x => x.ok) ? "ok" : "warn");
     }
-    await initRealm(); loadAccounts(); loadModels();
+    await refreshActiveRealm(); window.updateUI(); loadAccounts(); loadModels();
   }catch(e){ toast("签到失败: " + e.message, "bad"); }
+  finally { btn.disabled = false; btn.textContent = ot; }
+}
+
+async function doDailyChat(btn){
+  btn.disabled = true; const ot = btn.textContent; btn.textContent = "打卡中...";
+  try {
+    const r = await postJSON("/accounts/daily-chat", {});
+    const res = r.results || [];
+    if(!res.length) toast("未发现国际版账号", "warn");
+    else {
+      const summary = res.map(x => (x.nickname||x.uid.slice(0,6)) + ": " + (x.ok ? "活跃打卡成功" : (x.error||x.msg))).join("；");
+      toast("每日活跃: " + summary, res.some(x => x.ok) ? "ok" : "warn");
+    }
+    await refreshActiveRealm(); window.updateUI(); loadAccounts(); loadModels();
+  }catch(e){ toast("打卡失败: " + e.message, "bad"); }
   finally { btn.disabled = false; btn.textContent = ot; }
 }
 
@@ -1622,7 +1655,7 @@ function accountRow(a){
     +   '<div class="acct-actions-row">'
     +     '<button class="sec mini" onclick="toggleAccount(&quot;' + uidAttr + '&quot;,' + (!a.enabled) + ', this)">' + (a.enabled ? '停用' : '启用') + '</button>'
     +     '<button class="sec mini" onclick="testAccount(&quot;' + uidAttr + '&quot;, this)">测试</button>'
-    +     '<button class="sec mini" onclick="refreshOne(&quot;' + uidAttr + '&quot;, this)">刷新</button>'
+    +     '<button class="sec mini" onclick="refreshOne(&quot;' + uidAttr + '&quot;, this)">刷新凭证</button>'
     +   '</div>'
     +   '<div class="acct-actions-row">'
     +     '<div class="id-btn-group" title="出站身分：默认 WorkBuddy 桌面端 (WB) / 官方 VSCode 插件 (VSC) / 官方 CodeBuddy CLI (CLI)">'
@@ -1758,7 +1791,7 @@ async function refreshOne(uid, btn){
   }catch(e){
     toast('刷新失败: ' + e.message, 'bad');
   }finally{
-    if(btn){ btn.disabled = false; btn.textContent = '刷新'; }
+    if(btn){ btn.disabled = false; btn.textContent = '刷新凭证'; }
   }
 }
 async function testAccount(uid, btn){
@@ -2991,10 +3024,12 @@ function importDiscovered(){
 }
 
 async function autoAssignSlots(){
+  // Only fills in accounts that have no exit yet: an account that is already
+  // bound keeps its slot, so this is not a rebalancer.
   const unbound = (window.ACCOUNTS || []).filter(a => a.enabled && !a.proxySlot);
-  if(!unbound.length){ toast('所有已启用账号都已绑定槽位', 'ok'); return; }
+  if(!unbound.length){ toast('所有已启用账号都已绑定代理出口', 'ok'); return; }
   const slots = PROXY_SLOTS.filter(s => s.enabled !== false);
-  if(!slots.length){ toast('没有可用槽位，请先添加并保存', 'warn'); return; }
+  if(!slots.length){ toast('没有启用的代理槽，请先在「设置 → 代理槽」添加并保存', 'warn'); return; }
   let i = 0;
   for(const a of unbound){
     const slot = slots[i % slots.length];
@@ -3003,7 +3038,7 @@ async function autoAssignSlots(){
   }
   await loadAccounts();
   await loadProxySlots();
-  toast('已为 ' + unbound.length + ' 个已启用账号分配出口', 'ok');
+  toast('已为 ' + unbound.length + ' 个未绑定账号分配代理出口', 'ok');
 }
 
 function switchMainTab(tab){

@@ -1335,7 +1335,7 @@ def runtime_settings_view():
         "accounts_dir": ACCOUNTS_DIR,
         "usage_dir": USAGE_DIR,
         "settings_file": wb_settings.settings_path(ACCOUNTS_DIR),
-        "version": "1.5.7",
+        "version": "1.6.2",
     }
 def current_account():
     """Account used for display purposes (health / usage summaries)."""
@@ -1881,18 +1881,32 @@ SANITIZE_REWRITES = (
 SANITIZE_HDR_RE = re.compile(r"(?i)x-anthropic-billing-header:[^;\r\n]*;?\s*")
 SANITIZE_BARE_HDR_RE = re.compile(r"(?i)x-anthropic-billing-header")
 SANITIZE_KV_RE = re.compile(r"(?i)\bcc_[a-z0-9_]+=[^;\r\n]*;?\s*")
+# WorkBuddy upstream returns 11128 ("Illegal API invocation from an unapproved
+# channel") when this exact OmO identity fingerprint appears as a contiguous
+# substring in a system message. A/B tests show the match is case-insensitive,
+# survives surrounding prefix/suffix text, and stops matching when the phrase
+# structure is changed. Rewrite only this confirmed fingerprint, leaving the
+# agent identity and behaviour intact while dropping the framework attribution.
+SANITIZE_OMO_JUNIOR_RE = re.compile(
+    r"Sisyphus-Junior - Focused executor from OhMyOpenCode", re.IGNORECASE
+)
 def has_fingerprint(text):
     if not isinstance(text, str) or not text:
         return False
     for f in SANITIZE_FEATURES:
         if f in text:
             return True
-    return bool(SANITIZE_BARE_HDR_RE.search(text))
+    return bool(SANITIZE_BARE_HDR_RE.search(text) or SANITIZE_OMO_JUNIOR_RE.search(text))
 def sanitize_text(text):
     if not isinstance(text, str) or not text:
         return text
     if not has_fingerprint(text):
         return text
+    # Keep the rewrite deliberately narrow: do not globally remove
+    # "OhMyOpenCode" or "Sisyphus-Junior", because either token alone is
+    # accepted by the upstream. Only the confirmed contiguous fingerprint is
+    # neutralized.
+    text = SANITIZE_OMO_JUNIOR_RE.sub("Sisyphus-Junior - Focused executor", text)
     for old, new in SANITIZE_REWRITES:
         text = text.replace(old, new)
     text = SANITIZE_HDR_RE.sub("", text)
@@ -4117,7 +4131,7 @@ class Handler(BaseHTTPRequestHandler):
             super().finish()
         except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError):
             pass
-    server_version = "wb-proxy/1.5.7"
+    server_version = "wb-proxy/1.6.2"
     def log_message(self, fmt, *args):
         # 静默过滤前端看板高频定时心跳的正常 200 GET 请求（/logs、/usage、/accounts 轮询等）
         # 避免自增死循环刷屏与日志污染。遇 4xx/5xx 异常或所有非 GET 业务操作依然如实记录。
@@ -5084,6 +5098,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._route_realm(payload)
         if path == "/accounts/checkin":
             return self._route_accounts_checkin(payload)
+        if path == "/accounts/daily-chat":
+            return self._route_accounts_daily_chat(payload)
         if path == "/accounts/login/start":
             return self._route_accounts_login_start(payload)
         if path == "/accounts/login/cancel":
@@ -5274,6 +5290,20 @@ class Handler(BaseHTTPRequestHandler):
             if account is None:
                 continue
             res = account.checkin()
+            results.append({"uid": account.uid, "nickname": account.nickname, **res})
+        return self._json(200, {"results": results, "accounts": account_views()})
+
+    def _route_accounts_daily_chat(self, payload):
+        uid = payload.get("uid")
+        if uid:
+            targets = [POOL.get(uid)]
+        else:
+            targets = [a for a in POOL.accounts if a.realm == "intl" and a.enabled]
+        results = []
+        for account in targets:
+            if account is None:
+                continue
+            res = account.daily_chat()
             results.append({"uid": account.uid, "nickname": account.nickname, **res})
         return self._json(200, {"results": results, "accounts": account_views()})
 
