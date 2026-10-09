@@ -30,9 +30,23 @@ LEGACY_PRICING_REFRESH_HOURS_KEY = "pricing_refresh_hours"
 PRICING_REFRESH_MINUTES_KEY = "pricing_refresh_minutes"
 # A month, the old cap converted: 720 hours = 43200 minutes.
 MAX_PRICING_REFRESH_MINUTES = 24 * 30 * 60
+# How stale an account's credit balance may get before the background
+# refresher updates it, in hours. Only the sign-in / daily-activity tasks used
+# to refresh balances, so a dispatch decision could rest on a balance days old.
+# 12 hours is deliberately slack: the preference is measured in days, so half a
+# day of drift moves an account by at most half a day inside a 7-day window,
+# and the wider TTL keeps the refresher from spending upstream billing calls it
+# does not need.
+DEFAULT_CREDITS_REFRESH_HOURS = 12.0
+MAX_CREDITS_REFRESH_HOURS = 24 * 30
+CREDITS_REFRESH_HOURS_KEY = "credits_refresh_hours"
 # Whether a model name may inherit its price from a suffix-stripped base
 # (deepseek-r1-0528-lkeap → deepseek-r1-0528). Missing key reads as on.
 PRICING_VARIANT_INHERIT_KEY = "pricing_variant_inherit"
+# Master switch for the whole OpenRouter price-estimation feature. Missing key
+# reads as on: an install that predates the setting behaves exactly as it did,
+# and only an explicit false turns the feature off.
+PRICING_ENABLED_KEY = "pricing_enabled"
 
 _lock = threading.RLock()
 
@@ -72,6 +86,24 @@ def save(accounts_dir, data):
             json.dump(data, fh, ensure_ascii=False, indent=2)
         os.replace(tmp, path)
         return path
+
+
+def deep_merge(base, patch):
+    """Recursively merge patch into base; unknown sibling keys survive.
+
+    The panel form only submits the keys it manages. Replacing a whole group
+    would silently drop hand-written or future keys, so nested objects merge
+    key by key. Returns a new dict; the inputs are not mutated.
+    """
+    if not isinstance(base, dict) or not isinstance(patch, dict):
+        return patch
+    out = dict(base)
+    for key, value in patch.items():
+        if isinstance(value, dict) and isinstance(out.get(key), dict):
+            out[key] = deep_merge(out[key], value)
+        else:
+            out[key] = value
+    return out
 
 
 def panel_password_is_default(accounts_dir):
@@ -312,22 +344,57 @@ def api_keys(accounts_dir, include_deleted=False):
     return []
 
 
-def set_api_keys(accounts_dir, keys):
-    """Replace the whole key list. Returns the saved (live) list.
+def _retired_key_entry(old):
+    """The soft-deleted form of a stored key: name and dates kept, secret gone."""
+    return {
+        "id": old["id"],
+        "name": old["name"],
+        "key": "",
+        "realm": old.get("realm") or "",
+        "models": old.get("models") or [],
+        "enabled": False,
+        "created_at": old.get("created_at") or "",
+        "deleted_at": old.get("deleted_at") or time.strftime("%Y/%m/%d %H:%M"),
+    }
 
-    Removal is a soft delete. The caller is the panel, which can only submit
-    the rows it can see and cannot see deleted ones, so an id that vanishes
-    from the submission is marked deleted instead of dropped: the usage log
-    attributes spend by id, and losing the id would dump a key's whole history
-    into "(未知 key)". The secret is wiped at that same moment, so a deleted
-    key can never authenticate again.
+
+def set_api_keys(accounts_dir, keys, delete_ids=None):
+    """Save the key list. Returns the saved (live) list.
+
+    Removal is a soft delete: the usage log attributes spend by id, so losing
+    an id would dump a key's whole history into "(未知 key)", and the secret is
+    wiped at the same moment so a deleted key can never authenticate again.
+
+    Two modes decide which stored keys get soft-deleted:
+
+    - `delete_ids is None`: replace semantics. Any stored key absent from
+      `keys` is retired. This is what an older panel relies on - it deletes a
+      row by leaving it out of the submission - so it stays the default.
+    - `delete_ids` is a list: upsert semantics. Only those ids are retired; a
+      stored key the submission does not mention is left untouched. The panel
+      uses this because its submission is whatever its in-memory rows happen
+      to be, and a list that is stale or incomplete (a second browser tab, a
+      save that raced the post-save reload, a reload that failed) must not
+      retire a key the user never removed.
     """
     with _lock:
         previous = api_keys(accounts_dir, include_deleted=True)
+        upsert = delete_ids is not None
+        drop = {str(entry_id) for entry_id in (delete_ids or [])}
+        # Upsert mode: a stored live secret, so a submitted row that lost its id
+        # (a stale panel resubmitting a key it already saved) can adopt the
+        # stored id and update that key in place instead of minting a new one
+        # and splitting its usage history in two.
+        live_secret_id = {}
+        if upsert:
+            for old in previous:
+                if old["key"] and not old.get("deleted_at"):
+                    live_secret_id.setdefault(old["key"], old["id"])
         cleaned = []
         seen = set()
         seen_ids = set()
         for raw in keys or []:
+            raw_id = str((raw or {}).get("id") or "").strip() if isinstance(raw, dict) else ""
             entry = _clean_key_entry(raw)
             if entry is None:
                 continue
@@ -335,6 +402,8 @@ def set_api_keys(accounts_dir, keys):
                 if entry["key"] in seen:
                     continue
                 seen.add(entry["key"])
+            if upsert and entry["key"] and raw_id not in live_secret_id.values():
+                entry["id"] = live_secret_id.get(entry["key"], entry["id"])
             entry["id"] = _unique_key_id(entry["id"], seen_ids)
             seen_ids.add(entry["id"])
             cleaned.append(entry)
@@ -342,16 +411,21 @@ def set_api_keys(accounts_dir, keys):
             if old["id"] in seen_ids:
                 continue
             seen_ids.add(old["id"])
-            cleaned.append({
-                "id": old["id"],
-                "name": old["name"],
-                "key": "",
-                "realm": old.get("realm") or "",
-                "models": old.get("models") or [],
-                "enabled": False,
-                "created_at": old.get("created_at") or "",
-                "deleted_at": old.get("deleted_at") or time.strftime("%Y/%m/%d %H:%M"),
-            })
+            # Upsert mode keeps a stored key the submission never mentioned.
+            # An already-deleted row is kept too: it is read-only history.
+            if upsert and old["id"] not in drop:
+                # A submitted row may already carry this exact secret (the
+                # stale submission re-sent it under a fresh id). Two live rows
+                # with one secret is the duplicate this mode exists to avoid,
+                # so the stale stored copy is retired instead.
+                if old["key"] and old["key"] in seen:
+                    cleaned.append(_retired_key_entry(old))
+                    continue
+                if old["key"]:
+                    seen.add(old["key"])
+                cleaned.append(old)
+                continue
+            cleaned.append(_retired_key_entry(old))
         data = load(accounts_dir)
         data["api_keys"] = cleaned
         # The single-key fields are now derived; drop them so there is one
@@ -406,62 +480,216 @@ def set_auth_disabled(accounts_dir, disabled):
         save(accounts_dir, data)
 
 
-def reserve_credits(accounts_dir):
+# ------------------------------------------------------------------ limits
+# The four guards share one shape: a global default that covers both realms,
+# plus an optional per-realm override. An override left empty inherits the
+# global value, so an install that never touches it behaves exactly as before,
+# and one that does only ever has to reason about a single number per guard.
+LIMIT_KEYS = ("reserve_credits", "daily_token_limit",
+              "daily_credit_limit", "model_daily_token_limit",
+              "expiring_window_days")
+LIMIT_REALMS = ("intl", "cn")
+LIMIT_SCOPES = ("global",) + LIMIT_REALMS
+LIMITS_KEY = "limits"
+
+# Guards whose global default is not "off". Every key still reads 0 as off;
+# only the expiring-credits window ships enabled, because 0 would make the
+# preference a silent no-op until someone turned it on by hand.
+LIMIT_DEFAULTS = {"expiring_window_days": 7}
+
+
+def _default_global(key):
+    """The global value an install reads before it ever saves one."""
+    try:
+        return max(0, int(LIMIT_DEFAULTS.get(key, 0)))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _empty_limit_entry(key=None):
+    """One guard: a global default plus a slot per realm (None = inherit)."""
+    return {"global": _default_global(key), "intl": None, "cn": None}
+
+
+def _coerce_global(value):
+    """A global threshold. Junk and negatives collapse to 0 (off), which is
+    also what every install predating the setting reads as."""
+    try:
+        number = int(value or 0)
+    except (TypeError, ValueError):
+        number = 0
+    return max(0, number)
+
+
+def _coerce_override(value):
+    """A per-realm override. None (or a blank form field) means "inherit the
+    global default", kept distinct from an explicit 0 ("off for this realm")."""
+    if value is None or value == "":
+        return None
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return None
+    return max(0, number)
+
+
+def _fold_legacy_limits(data):
+    """Move the four flat top-level guards into `limits`.
+
+    Returns (changed, limits). The old keys are dropped as they are folded in,
+    so a later rollback cannot resurrect a stale limit from beside the grouped
+    copy.
+    """
+    limits = {}
+    changed = False
+    for key in LIMIT_KEYS:
+        entry = _empty_limit_entry(key)
+        if key in data:
+            entry["global"] = _coerce_global(data.pop(key))
+            changed = True
+        limits[key] = entry
+    return changed, limits
+
+
+def _normalize_limits(raw):
+    """A copy of the stored map with every key and scope filled in, so a
+    partial or hand-edited settings.json still reads as a complete shape."""
+    limits = {}
+    for key in LIMIT_KEYS:
+        entry = raw.get(key)
+        if not isinstance(entry, dict):
+            entry = {}
+        global_raw = entry.get("global")
+        # A missing global falls back to that guard's own default (0 for every
+        # guard but the expiring window); an explicit 0 is a real "off" and is
+        # kept as one, so a saved "off" never silently comes back on.
+        global_value = (_default_global(key) if global_raw is None
+                        else _coerce_global(global_raw))
+        limits[key] = {
+            "global": global_value,
+            "intl": _coerce_override(entry.get("intl")),
+            "cn": _coerce_override(entry.get("cn")),
+        }
+    return limits
+
+
+def limits_data(accounts_dir):
+    """The grouped limits map, migrating a flat pre-grouping file on first read.
+
+    Reading is what upgrades: the first look at an old settings.json folds the
+    four flat keys into `limits` and rewrites the file, so the rest of the
+    gateway only ever sees one shape.
+    """
+    with _lock:
+        data = load(accounts_dir)
+        raw = data.get(LIMITS_KEY)
+        if isinstance(raw, dict):
+            return _normalize_limits(raw)
+        changed, limits = _fold_legacy_limits(data)
+        if changed:
+            data[LIMITS_KEY] = limits
+            try:
+                save(accounts_dir, data)
+            except Exception:
+                # A read-only accounts dir must not take the panel down; the
+                # folded values are still returned and the next read retries.
+                pass
+        return limits
+
+
+def limits_snapshot(accounts_dir):
+    """The panel's view of every guard, keyed by limit then by scope."""
+    return limits_data(accounts_dir)
+
+
+def limit_value(accounts_dir, key, realm=None):
+    """One guard's effective value for a realm.
+
+    realm None (or "") returns the global default; an intl/cn override wins
+    when it is set. An unknown key reads as 0 (off), so a typo cannot wedge
+    the request path.
+    """
+    entry = limits_data(accounts_dir).get(key) or _empty_limit_entry()
+    if realm in LIMIT_REALMS:
+        override = entry.get(realm)
+        if override is not None:
+            return override
+    return entry.get("global") or 0
+
+
+def limit_values(accounts_dir, key):
+    """One guard resolved for every realm plus the global it inherits.
+
+    {"global": g, "intl": ..., "cn": ...}. The intl/cn entries already carry
+    the global value when no override is set, so the pool can hand each
+    account its own realm without a second settings lookup.
+    """
+    entry = limits_data(accounts_dir).get(key) or _empty_limit_entry()
+    global_value = entry.get("global") or 0
+    values = {"global": global_value}
+    for realm in LIMIT_REALMS:
+        override = entry.get(realm)
+        values[realm] = global_value if override is None else override
+    return values
+
+
+def set_limit(accounts_dir, key, scope, value):
+    """Persist one guard at one scope. Returns the stored entry.
+
+    scope is "global", "intl" or "cn"; a None/blank value clears an intl/cn
+    override back to "inherit", while the global slot always stores a number.
+    """
+    if key not in LIMIT_KEYS:
+        raise ValueError("unknown limit: %s" % key)
+    if scope not in LIMIT_SCOPES:
+        raise ValueError("unknown scope: %s" % scope)
+    with _lock:
+        data = load(accounts_dir)
+        raw = data.get(LIMITS_KEY)
+        if isinstance(raw, dict):
+            limits = _normalize_limits(raw)
+        else:
+            _changed, limits = _fold_legacy_limits(data)
+        entry = limits[key]
+        if scope == "global":
+            entry["global"] = _coerce_global(value)
+        else:
+            entry[scope] = _coerce_override(value)
+        data[LIMITS_KEY] = limits
+        save(accounts_dir, data)
+    return entry
+
+
+def reserve_credits(accounts_dir, realm=None):
     """Global low-credit guard: an account at or below this balance stays idle.
 
     Zero disables the guard, which keeps installs that predate the setting
     behaving exactly as before.
     """
-    try:
-        value = int(load(accounts_dir).get("reserve_credits") or 0)
-    except (TypeError, ValueError):
-        return 0
-    return value if value > 0 else 0
+    return limit_value(accounts_dir, "reserve_credits", realm)
 
 
 def set_reserve_credits(accounts_dir, value):
     """Persist the guard threshold. Returns the stored value."""
-    try:
-        value = int(value or 0)
-    except (TypeError, ValueError):
-        value = 0
-    value = max(0, value)
-    with _lock:
-        data = load(accounts_dir)
-        data["reserve_credits"] = value
-        save(accounts_dir, data)
-    return value
+    return set_limit(accounts_dir, "reserve_credits", "global", value)["global"]
 
 
-def daily_token_limit(accounts_dir):
+def daily_token_limit(accounts_dir, realm=None):
     """Global daily guard: an account that already burned this many tokens
     today stays idle until local midnight.
 
     Zero disables the guard, which keeps installs that predate the setting
     behaving exactly as before.
     """
-    try:
-        value = int(load(accounts_dir).get("daily_token_limit") or 0)
-    except (TypeError, ValueError):
-        return 0
-    return value if value > 0 else 0
+    return limit_value(accounts_dir, "daily_token_limit", realm)
 
 
 def set_daily_token_limit(accounts_dir, value):
     """Persist the daily token threshold. Returns the stored value."""
-    try:
-        value = int(value or 0)
-    except (TypeError, ValueError):
-        value = 0
-    value = max(0, value)
-    with _lock:
-        data = load(accounts_dir)
-        data["daily_token_limit"] = value
-        save(accounts_dir, data)
-    return value
+    return set_limit(accounts_dir, "daily_token_limit", "global", value)["global"]
 
 
-def daily_credit_limit(accounts_dir):
+def daily_credit_limit(accounts_dir, realm=None):
     """Daily credit guard: an account that already spent this many credits
     today serves free models only until local midnight, so a client that
     would keep burning credits on paid models rotates to another account
@@ -470,25 +698,80 @@ def daily_credit_limit(accounts_dir):
     Zero disables the guard, which keeps installs that predate the setting
     behaving exactly as before.
     """
-    try:
-        value = int(load(accounts_dir).get("daily_credit_limit") or 0)
-    except (TypeError, ValueError):
-        return 0
-    return value if value > 0 else 0
+    return limit_value(accounts_dir, "daily_credit_limit", realm)
 
 
 def set_daily_credit_limit(accounts_dir, value):
     """Persist the daily credit threshold. Returns the stored value."""
-    try:
-        value = int(value or 0)
-    except (TypeError, ValueError):
-        value = 0
-    value = max(0, value)
+    return set_limit(accounts_dir, "daily_credit_limit", "global", value)["global"]
+
+
+def model_daily_token_limit(accounts_dir, realm=None):
+    """Per-model daily guard: an account that already burned this many
+    tokens today on ONE model stops being handed out for that model until
+    local midnight, while every other model keeps working.
+
+    Zero disables the guard, which keeps installs that predate the setting
+    behaving exactly as before.
+    """
+    return limit_value(accounts_dir, "model_daily_token_limit", realm)
+
+
+def set_model_daily_token_limit(accounts_dir, value):
+    """Persist the per-model daily token threshold. Returns the stored value."""
+    return set_limit(accounts_dir, "model_daily_token_limit", "global", value)["global"]
+
+
+def expiring_window_days(accounts_dir, realm=None):
+    """Window, in days, inside which an account's soonest-expiring credit
+    package makes the pool hand that account out first, so credits about to
+    lapse are spent before they are lost.
+
+    Zero disables the preference and dispatch falls back to a plain
+    round-robin; the shipped default is 7 days.
+    """
+    return limit_value(accounts_dir, "expiring_window_days", realm)
+
+
+def set_expiring_window_days(accounts_dir, value):
+    """Persist the window. Returns the stored value."""
+    return set_limit(accounts_dir, "expiring_window_days", "global", value)["global"]
+
+
+def credits_refresh_hours(accounts_dir):
+    """How stale a credit balance may get before the background refresher
+    updates it, in hours.
+
+    The dispatch preference reads the balance, and only the sign-in and
+    daily-activity tasks used to refresh it, so an account could be judged on a
+    balance days old - or on whatever was on disk when the process started.
+    Zero disables the refresher. Anything not a number falls back to the
+    default, so a hand-edited settings.json cannot wedge the loop.
+    """
     with _lock:
         data = load(accounts_dir)
-        data["daily_credit_limit"] = value
+        raw = data.get(CREDITS_REFRESH_HOURS_KEY)
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_CREDITS_REFRESH_HOURS
+    if value < 0:
+        return DEFAULT_CREDITS_REFRESH_HOURS
+    return min(value, MAX_CREDITS_REFRESH_HOURS)
+
+
+def set_credits_refresh_hours(accounts_dir, value):
+    """Persist the refresh TTL. Returns the stored value."""
+    try:
+        hours = float(value)
+    except (TypeError, ValueError):
+        hours = 0.0
+    hours = max(0.0, min(MAX_CREDITS_REFRESH_HOURS, hours))
+    with _lock:
+        data = load(accounts_dir)
+        data[CREDITS_REFRESH_HOURS_KEY] = hours
         save(accounts_dir, data)
-    return value
+    return hours
 
 
 def _clamp_refresh_minutes(value):
@@ -567,33 +850,6 @@ def set_pricing_refresh_minutes(accounts_dir, value):
     return value
 
 
-def model_daily_token_limit(accounts_dir):
-    """Per-model daily guard: an account that already burned this many
-    tokens today on ONE model stops being handed out for that model until
-    local midnight, while every other model keeps working.
-
-    Zero disables the guard, which keeps installs that predate the setting
-    behaving exactly as before.
-    """
-    try:
-        value = int(load(accounts_dir).get("model_daily_token_limit") or 0)
-    except (TypeError, ValueError):
-        return 0
-    return value if value > 0 else 0
-
-
-def set_model_daily_token_limit(accounts_dir, value):
-    """Persist the per-model daily token threshold. Returns the stored value."""
-    try:
-        value = int(value or 0)
-    except (TypeError, ValueError):
-        value = 0
-    value = max(0, value)
-    with _lock:
-        data = load(accounts_dir)
-        data["model_daily_token_limit"] = value
-        save(accounts_dir, data)
-    return value
 def pricing_variant_inherit(accounts_dir):
     """Whether a model name may inherit its price from a suffix-stripped base.
 
@@ -617,6 +873,138 @@ def set_pricing_variant_inherit(accounts_dir, enabled):
         data[PRICING_VARIANT_INHERIT_KEY] = enabled
         save(accounts_dir, data)
     return enabled
+
+
+def pricing_enabled(accounts_dir):
+    """Master switch for the OpenRouter price estimation, on unless turned off.
+
+    Off disables the feature end to end: no price fetch, no policy table, no
+    per-row cost and no cost columns. A settings.json that predates the key
+    reads back as on, which is the behaviour every install ships with - the
+    switch only exists to let an operator turn the whole thing off.
+    """
+    value = load(accounts_dir).get(PRICING_ENABLED_KEY)
+    return True if value is None else value is True
+
+
+def set_pricing_enabled(accounts_dir, enabled):
+    """Persist the master switch. Returns the stored boolean."""
+    enabled = bool(enabled)
+    with _lock:
+        data = load(accounts_dir)
+        data[PRICING_ENABLED_KEY] = enabled
+        save(accounts_dir, data)
+    return enabled
+
+
+UPSTREAM_DEFAULTS = {
+    "header_timeout_seconds": 120,
+    "idle_timeout_seconds": 300,
+    "device_token": "",
+    "device_token_file": "",
+}
+
+
+def validate_upstream_patch(raw):
+    """Strict validation for a panel-saved upstream patch."""
+    out = {}
+    for key, value in (raw or {}).items():
+        if key in ("header_timeout_seconds", "idle_timeout_seconds"):
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError("%s must be a whole number of seconds" % key)
+            if value < 1:
+                raise ValueError("%s cannot be less than 1" % key)
+            out[key] = value
+        elif key in ("device_token", "device_token_file"):
+            if not isinstance(value, str):
+                raise ValueError("%s must be a string" % key)
+            out[key] = value.strip()
+        else:
+            raise ValueError("unknown upstream setting %r" % key)
+    return out
+
+
+def upstream_config(accounts_dir):
+    """Chat socket timeouts and the optional X-Device-Token source."""
+    stored = load(accounts_dir).get("upstream")
+    stored = stored if isinstance(stored, dict) else {}
+    out = {}
+    for key, default in UPSTREAM_DEFAULTS.items():
+        value = stored.get(key, default)
+        if key in ("header_timeout_seconds", "idle_timeout_seconds"):
+            out[key] = (value if isinstance(value, int) and not isinstance(value, bool)
+                        and value >= 1 else default)
+        else:
+            out[key] = value.strip() if isinstance(value, str) else default
+    return out
+
+
+def set_upstream_config(accounts_dir, cfg):
+    """Persist the upstream settings. Returns the stored config."""
+    current = upstream_config(accounts_dir)
+    if isinstance(cfg, dict):
+        current.update({k: v for k, v in cfg.items() if k in UPSTREAM_DEFAULTS})
+    clean = validate_upstream_patch(current)
+    with _lock:
+        data = load(accounts_dir)
+        data["upstream"] = deep_merge(data.get("upstream"), clean)
+        save(accounts_dir, data)
+    return clean
+
+
+PROMPT_DEFAULTS = {
+    "mode": "passthrough",
+    "file": "",
+}
+
+
+def validate_prompt_patch(raw):
+    """Strict validation for a panel-saved prompt patch."""
+    out = {}
+    for key, value in (raw or {}).items():
+        if key == "mode":
+            if not isinstance(value, str):
+                raise ValueError("prompt mode must be a string")
+            mode = value.strip().lower()
+            if mode not in ("passthrough", "custom", "append"):
+                raise ValueError("prompt mode must be passthrough, custom or append")
+            out["mode"] = mode
+        elif key == "file":
+            if not isinstance(value, str):
+                raise ValueError("prompt file must be a string")
+            out["file"] = value.strip()
+        else:
+            raise ValueError("unknown prompt setting %r" % key)
+    return out
+
+
+def prompt_config(accounts_dir):
+    """Gateway system-prompt mode (default passthrough = legacy behaviour)."""
+    stored = load(accounts_dir).get("prompt")
+    stored = stored if isinstance(stored, dict) else {}
+    mode = stored.get("mode", PROMPT_DEFAULTS["mode"])
+    if not isinstance(mode, str) or mode.strip().lower() not in (
+            "passthrough", "custom", "append"):
+        mode = PROMPT_DEFAULTS["mode"]
+    else:
+        mode = mode.strip().lower()
+    file_path = stored.get("file", PROMPT_DEFAULTS["file"])
+    if not isinstance(file_path, str):
+        file_path = PROMPT_DEFAULTS["file"]
+    return {"mode": mode, "file": file_path.strip()}
+
+
+def set_prompt_config(accounts_dir, cfg):
+    """Persist the prompt settings. Returns the stored config."""
+    current = prompt_config(accounts_dir)
+    if isinstance(cfg, dict):
+        current.update({k: v for k, v in cfg.items() if k in PROMPT_DEFAULTS})
+    clean = validate_prompt_patch(current)
+    with _lock:
+        data = load(accounts_dir)
+        data["prompt"] = clean
+        save(accounts_dir, data)
+    return clean
 
 
 def auto_switch_product(accounts_dir):

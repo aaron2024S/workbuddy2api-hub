@@ -14,8 +14,12 @@ import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
-os.environ.setdefault("ACCOUNTS_DIR", os.path.join(ROOT, "tests", "_acc_test"))
-os.environ.setdefault("USAGE_DIR", os.path.join(ROOT, "tests", "_use_test"))
+from _isolated_dirs import isolated_data_dirs  # noqa: E402  (its own data root)
+# Its own directories, removed when this process exits. This suite used to share
+# tests/_acc_test and tests/_use_test with _test_daily_chat.py and
+# _test_sanitize_fingerprint.py, which made them unsafe to run at the same time
+# and left directories in the repo after a run.
+_TMP = isolated_data_dirs("wb-tasks-cache-")
 
 import wb_proxy as P        # noqa: E402
 import wb_tasks as T        # noqa: E402
