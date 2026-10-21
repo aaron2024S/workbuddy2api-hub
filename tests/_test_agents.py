@@ -11,6 +11,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import sys
 import tempfile
 
@@ -169,14 +170,22 @@ t1 = A.toml_upsert_top_key(t1, "model_provider", "wb-proxy")
 t1 = A.toml_upsert_top_key(t1, "model", "m1")
 t1 = A.toml_upsert_table(t1, "model_providers.wb-proxy",
                          {"name": "WB Proxy", "base_url": "http://x/v1",
-                          "wire_api": "responses", "env_key": "OPENAI_API_KEY"})
+                          "wire_api": "responses", "experimental_bearer_token": "k"})
 t2 = t1
 t2 = A.toml_upsert_top_key(t2, "model_provider", "wb-proxy")
 t2 = A.toml_upsert_top_key(t2, "model", "m1")
 t2 = A.toml_upsert_table(t2, "model_providers.wb-proxy",
                          {"name": "WB Proxy", "base_url": "http://x/v1",
-                          "wire_api": "responses", "env_key": "OPENAI_API_KEY"})
+                          "wire_api": "responses", "experimental_bearer_token": "k"})
 check("second application changes nothing", t1 == t2, (t1, t2))
+
+t3 = A.toml_upsert_table("", "model_providers.wb-proxy",
+                         {"name": "WB", "env_key": "OPENAI_API_KEY"})
+t3 = A.toml_drop_table_keys(t3, "model_providers.wb-proxy", ("env_key",))
+check("env_key is removed when the inline token takes over",
+      "env_key" not in t3 and 'name = "WB"' in t3, repr(t3))
+check("dropping an absent key is a no-op",
+      A.toml_drop_table_keys(t3, "model_providers.wb-proxy", ("env_key",)) == t3)
 
 print()
 print("[10] toml table upsert keeps other keys in the same table")
@@ -231,8 +240,9 @@ check("inputs are not mutated", base["env"]["A"] == 1, base)
 print()
 print("[13] client registry integrity")
 
-check("all five expected clients registered",
-      sorted(A.CLIENTS) == ["claude-code", "codex", "crush", "dsh", "opencode"],
+check("all six expected clients registered",
+      sorted(A.CLIENTS) == ["claude-code", "codex", "crush", "dsh", "opencode",
+                            "zcode"],
       sorted(A.CLIENTS))
 ids = [c["id"] for c in A.CLIENTS.values()]
 check("registry ids are unique", len(set(ids)) == len(ids), ids)
@@ -407,12 +417,12 @@ for cid in sorted(A.CLIENTS):
     except Exception as exc:  # noqa: BLE001 - report every client
         all_ok = False
         notes[cid] = "raised: %r" % exc
-check("all five clients applied and restored cleanly", all_ok, notes)
+check("all six clients applied and restored cleanly", all_ok, notes)
 check("state is empty after restoring everything",
       A._load_state(acct5) == {}, A._load_state(acct5))
 
 print()
-print("[20] codex + dsh written contents are shaped correctly")
+print("[20] written client configs are shaped correctly")
 
 home6 = tempfile.mkdtemp(prefix="wb-agents-home6-")
 acct6 = tempfile.mkdtemp(prefix="wb-agents-acct6-")
@@ -473,10 +483,84 @@ check("crush model entries carry context_window",
       cr["providers"]["wb-proxy"]["models"][0]["context_window"] == 128000,
       cr["providers"]["wb-proxy"]["models"])
 
+A.integrate(acct6, "zcode", "http://gw:1", "k-zc", model="m-big",
+            models=models, home=home6)
+zc_path = os.path.join(home6, ".zcode", "v2", "provider_config.json")
+with open(zc_path, encoding="utf-8") as fh:
+    zc = json.load(fh)
+zc_rules = zc["config"]["providerConfigRules"]["providerRules"]
+check("zcode rule carries the gateway URL and the key",
+      zc_rules[0]["providerId"] == "wb-proxy"
+      and zc_rules[0]["config"]["api"]["baseUrl"] == "http://gw:1/v1"
+      and zc_rules[0]["config"]["access"]["apiKey"] == "k-zc", zc_rules)
+check("zcode model ids carried into personalModelIds/modelOrder",
+      zc_rules[0]["config"]["personalModelIds"] == ["m-big", "m-small"]
+      and zc_rules[0]["config"]["modelOrder"] == ["m-big", "m-small"],
+      zc_rules[0])
+check("zcode providerOrder lists the provider",
+      zc["config"]["providerOrder"] == ["wb-proxy"], zc["config"])
+check("zcode schemaVersion kept", zc.get("schemaVersion") == 1, zc)
+
 for path in (codex_cfg, os.path.join(home6, ".codex", "auth.json"),
              dsh_settings, os.path.join(home6, ".dsh", ".credentials.yaml"),
-             oc_path, crush_path):
+             oc_path, crush_path, zc_path):
     pass
+
+print()
+print("[20b] zcode: other providers, their order and model rules survive re-apply")
+
+home15 = tempfile.mkdtemp(prefix="wb-agents-home15-")
+acct15 = tempfile.mkdtemp(prefix="wb-agents-acct15-")
+zc_dir = os.path.join(home15, ".zcode", "v2")
+os.makedirs(zc_dir)
+zc_other_rule = {
+    "providerId": "other-provider",
+    "providerName": "Other",
+    "config": {"group": "standard-personal",
+               "access": {"type": "api-key", "apiKey": "k-other"},
+               "api": {"type": "anthropic-messages",
+                       "baseUrl": "https://other.example/v1"}},
+}
+zc_original = {
+    "schemaVersion": 1,
+    "config": {
+        "providerOrder": ["other-provider"],
+        "providerConfigRules": {"providerRules": [zc_other_rule]},
+        "modelConfigRules": {"keep": {"me": True}},
+    },
+}
+zc_original_bytes = json.dumps(zc_original).encode("utf-8")
+with open(os.path.join(zc_dir, "provider_config.json"), "wb") as fh:
+    fh.write(zc_original_bytes)
+
+A.integrate(acct15, "zcode", "http://gw:1", "k-first", model="m-big",
+            models=models, home=home15)
+A.integrate(acct15, "zcode", "http://gw:2", "k-second", model="m-small",
+            models=[{"id": "m-small"}], home=home15)
+with open(os.path.join(zc_dir, "provider_config.json"), encoding="utf-8") as fh:
+    zc2 = json.load(fh)
+rules2 = zc2["config"]["providerConfigRules"]["providerRules"]
+check("re-apply updates the one wb-proxy rule instead of stacking new ones",
+      len(rules2) == 2
+      and [r["providerId"] for r in rules2] == ["other-provider", "wb-proxy"],
+      rules2)
+check("re-apply refreshes key, base URL and model list",
+      rules2[1]["config"]["access"]["apiKey"] == "k-second"
+      and rules2[1]["config"]["api"]["baseUrl"] == "http://gw:2/v1"
+      and rules2[1]["config"]["personalModelIds"] == ["m-small"], rules2[1])
+check("the other provider rule survives verbatim",
+      rules2[0] == zc_other_rule, rules2[0])
+check("providerOrder appends ours without touching the existing entry",
+      zc2["config"]["providerOrder"] == ["other-provider", "wb-proxy"],
+      zc2["config"])
+check("unrelated config keys survive",
+      zc2["config"]["modelConfigRules"] == {"keep": {"me": True}},
+      zc2["config"])
+
+A.restore(acct15, "zcode", home=home15)
+with open(os.path.join(zc_dir, "provider_config.json"), "rb") as fh:
+    check("restore returns the pre-integration bytes",
+          fh.read() == zc_original_bytes)
 
 print()
 print("[21] oversized config file is refused")
@@ -751,6 +835,86 @@ check("wb_proxy no longer imports wb_agents at module level",
 check("wb_agents is imported lazily inside agents_module()",
       "def agents_module()" in proxy_src and "        import wb_agents" in proxy_src)
 
+print()
+print("[29] credential files land owner-only (issue #345)")
+
+# 本模块写出的每个文件都带网关 API Key（明文内联，或由同目录凭据文件解析的
+# env 引用），所以 apply 不能让它们 group/world 可读：DSH 遇到 0644 的凭据文件
+# 直接拒绝启动，而且用户手动 chmod 600 之后再次配置不能被改回宽松。
+home16 = tempfile.mkdtemp(prefix="wb-agents-cred-")
+acct16 = tempfile.mkdtemp(prefix="wb-agents-cred-acct-")
+
+
+def mode_of(path):
+    return stat.S_IMODE(os.stat(path).st_mode)
+
+
+A.integrate(acct16, "dsh", "http://127.0.0.1:8788/v1", "key", home=home16)
+cred16 = os.path.join(home16, ".dsh", ".credentials.yaml")
+settings16 = os.path.join(home16, ".dsh", "settings.yaml")
+
+if os.name == "posix":
+    check("a fresh DSH credentials file is 0600",
+          mode_of(cred16) == 0o600, "%04o" % mode_of(cred16))
+    check("its sibling settings.yaml is 0600 too",
+          mode_of(settings16) == 0o600, "%04o" % mode_of(settings16))
+
+    A.integrate(acct16, "dsh", "http://127.0.0.1:8788/v1", "key", home=home16)
+    check("re-applying leaves an already 0600 credentials file alone",
+          mode_of(cred16) == 0o600, "%04o" % mode_of(cred16))
+
+    os.chmod(cred16, 0o644)
+    A.integrate(acct16, "dsh", "http://127.0.0.1:8788/v1", "key", home=home16)
+    check("a 0644 file left by an older build is tightened to 0600",
+          mode_of(cred16) == 0o600, "%04o" % mode_of(cred16))
+
+    os.chmod(cred16, 0o400)
+    A.integrate(acct16, "dsh", "http://127.0.0.1:8788/v1", "key", home=home16)
+    check("a stricter 0400 the user chose is kept, never widened",
+          mode_of(cred16) == 0o400, "%04o" % mode_of(cred16))
+    os.chmod(cred16, 0o600)
+
+    A.integrate(acct16, "codex", "http://127.0.0.1:8788/v1", "key", home=home16)
+    check("codex auth.json is 0600",
+          mode_of(os.path.join(home16, ".codex", "auth.json")) == 0o600)
+    A.integrate(acct16, "opencode", "http://127.0.0.1:8788/v1", "key",
+                home=home16)
+    check("opencode's config with an inline apiKey is 0600",
+          mode_of(os.path.join(home16, ".config", "opencode",
+                               "opencode.json")) == 0o600)
+
+    # 备份保存的是原文件字节（同样可能含 Key），也必须 owner-only。
+    crush_dir = os.path.join(home16, ".config", "crush")
+    os.makedirs(crush_dir, exist_ok=True)
+    with open(os.path.join(crush_dir, "crush.json"), "w",
+              encoding="utf-8") as fh:
+        fh.write("{}\n")
+    A.integrate(acct16, "crush", "http://127.0.0.1:8788/v1", "key",
+                home=home16)
+    bdir16 = os.path.join(acct16, A.BACKUP_DIRNAME, "crush")
+    backups16 = [os.path.join(bdir16, n) for n in os.listdir(bdir16)]
+    check("the backup of the original file is 0600 as well",
+          bool(backups16) and all(mode_of(p) == 0o600 for p in backups16),
+          [(p, "%04o" % mode_of(p)) for p in backups16])
+
+    A.restore(acct16, "crush", home=home16)
+    check("restore writes the file back owner-only",
+          mode_of(os.path.join(crush_dir, "crush.json")) == 0o600)
+else:
+    # Windows has no POSIX mode bits, so assert the mode we *ask for* is 0600
+    # rather than open()'s 0666 & ~umask.
+    seen16 = []
+    real_chmod = os.chmod
+    os.chmod = lambda p, m, *a, **k: seen16.append((p, m))
+    try:
+        A.integrate(acct16, "codex", "http://127.0.0.1:8788/v1", "key",
+                    home=home16)
+    finally:
+        os.chmod = real_chmod
+    auth16 = os.path.join(home16, ".codex", "auth.json")
+    check("a fresh credentials write asks for 0600",
+          (auth16 + ".tmp", 0o600) in seen16, seen16)
+
 # ---------------------------------------------------------------------------
 # cleanup
 # ---------------------------------------------------------------------------
@@ -758,9 +922,44 @@ check("wb_agents is imported lazily inside agents_module()",
 for d in (home, accounts, home2, acct2, home3, acct3, home4, acct4,
           home5, acct5, home6, acct6, home7, acct7, home8, acct8,
           home9, acct9, home10, acct10, home11, acct11, home12, acct12,
-          home13, acct13, home14, acct14, home_paths):
+          home13, acct13, home14, acct14, home15, acct15, home16, acct16,
+          home_paths):
     shutil.rmtree(d, ignore_errors=True)
 
 print()
+print()
+print("[30] _agents_resolve_key raises AgentConfigError on non-existent key (issue #352)")
+import wb_proxy as P
+handler = P.Handler.__new__(P.Handler)
+wb_agents = P.agents_module()
+try:
+    handler._agents_resolve_key({"key_id": "definitely-not-a-key"}, [])
+    check("should have raised AgentConfigError", False)
+except Exception as exc:
+    check("raised AgentConfigError not NameError", isinstance(exc, wb_agents.AgentConfigError), type(exc))
+
+
+print()
+print("[31] codex one-click config no longer depends on an env var (issue #513)")
+seed_dir = tempfile.mkdtemp(prefix="codex513-")
+seed_cfg = os.path.join(seed_dir, "config.toml")
+seed_auth = os.path.join(seed_dir, "auth.json")
+with open(seed_cfg, "w", encoding="utf-8") as fh:
+    fh.write('model_provider = "wb-proxy"\n\n[model_providers.wb-proxy]\nname = "WB Proxy"\n'
+             'base_url = "http://old/v1"\nwire_api = "responses"\n'
+             'env_key = "OPENAI_API_KEY"\nenv_key_instructions = "export it"\n')
+codex_files = A._apply_codex({"config": seed_cfg, "auth": seed_auth},
+                             {"base_url_v1": "http://new/v1", "api_key": "sk-inline",
+                              "model": "m1"})
+codex_out = codex_files[seed_cfg]
+check("inline bearer token is written",
+      'experimental_bearer_token = "sk-inline"' in codex_out, codex_out)
+check("stale env_key and its instructions are removed",
+      "env_key" not in codex_out, codex_out)
+check("top-level keys survive the cleanup",
+      'model_provider = "wb-proxy"' in codex_out and 'model = "m1"' in codex_out,
+      codex_out)
+shutil.rmtree(seed_dir, ignore_errors=True)
+
 print("PASS=%d FAIL=%d" % (PASS, FAIL))
 sys.exit(1 if FAIL else 0)

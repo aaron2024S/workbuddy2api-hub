@@ -69,6 +69,27 @@ class FakeFetcher(object):
         return json.dumps(self.payload)
 
 
+def tag_url(tag):
+    return ("https://github.com/ardeyouxipianyi/workbuddy2api-hub"
+            "/releases/tag/" + tag)
+
+
+class Redirected(object):
+    """A followed redirect: urlopen reports the final URL and nothing else."""
+
+    def __init__(self, url):
+        self._url = url
+
+    def geturl(self):
+        return self._url
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return False
+
+
 def checker(directory, fetcher, **kwargs):
     kwargs.setdefault("first_delay", 0)
     kwargs.setdefault("poll_seconds", 0.01)
@@ -320,6 +341,76 @@ class FailureHandlingTests(unittest.TestCase):
         self.assertEqual(state["latest_version"], "")
 
 
+class QuotaFallbackTests(unittest.TestCase):
+    """The API's anonymous quota is 60/h **per egress IP**, so a shared exit can be
+    spent by somebody else and every check from that exit then fails. These run the
+    real fetcher with the socket layer stubbed: the injected fetcher the other
+    suites use sits above the fallback and cannot see it."""
+
+    def _stub(self, web, api_error=None):
+        """urlopen stand-in: the API refuses, the web endpoint answers `web`."""
+        calls = []
+
+        def urlopen(request, timeout=None):
+            calls.append(request)
+            if request.full_url == wb_updates.RELEASES_URL:
+                raise api_error or urllib.error.HTTPError(
+                    request.full_url, 403, "rate limited", {}, None)
+            if isinstance(web, Exception):
+                raise web
+            return web
+
+        return urlopen, calls
+
+    def test_an_api_quota_error_falls_back_to_the_web_endpoint(self):
+        with tempfile.TemporaryDirectory(prefix="upd-quota-") as d:
+            urlopen, calls = self._stub(Redirected(tag_url("v1.6.20")))
+            with mock.patch.object(wb_updates.urllib.request, "urlopen", urlopen):
+                status = checker(d, wb_updates.fetch_releases).check(manual=True)
+            self.assertEqual(len(calls), 2, "the API goes first, the web endpoint second")
+            self.assertEqual(status["last_error"], "")
+            self.assertEqual(status["latest_version"], "1.6.20")
+            self.assertTrue(status["update_available"])
+            self.assertEqual(status["release_url"], tag_url("v1.6.20"))
+
+    def test_a_transport_error_on_the_api_path_also_falls_back(self):
+        # A proxy can reset one host and serve the other, so the fallback must
+        # not care *why* the API call failed.
+        with tempfile.TemporaryDirectory(prefix="upd-quota-") as d:
+            urlopen, _calls = self._stub(Redirected(tag_url("v1.6.20")),
+                                         api_error=urllib.error.URLError("reset"))
+            with mock.patch.object(wb_updates.urllib.request, "urlopen", urlopen):
+                status = checker(d, wb_updates.fetch_releases).check(manual=True)
+            self.assertEqual(status["last_error"], "")
+            self.assertEqual(status["latest_version"], "1.6.20")
+
+    def test_a_failing_fallback_still_reports_the_api_cause(self):
+        with tempfile.TemporaryDirectory(prefix="upd-quota-") as d:
+            urlopen, _calls = self._stub(urllib.error.URLError("no route"))
+            with mock.patch.object(wb_updates.urllib.request, "urlopen", urlopen):
+                status = checker(d, wb_updates.fetch_releases).check(manual=True)
+            self.assertEqual(status["last_error"], "HTTP 403")
+            self.assertIsNone(status["latest_version"])
+
+    def test_the_optional_token_is_sent_and_never_stored(self):
+        token = "ghp-not-a-real-token"
+        sent = []
+
+        def urlopen(request, timeout=None):
+            sent.append(request.get_header("Authorization"))
+            return io.BytesIO(json.dumps([release("v1.6.20")]).encode("utf-8"))
+
+        with tempfile.TemporaryDirectory(prefix="upd-quota-") as d:
+            with mock.patch.dict(os.environ, {wb_updates.TOKEN_ENV: token}):
+                with mock.patch.object(wb_updates.urllib.request, "urlopen", urlopen):
+                    status = checker(d, wb_updates.fetch_releases).check(manual=True)
+            self.assertEqual(sent[0], "Bearer " + token)
+            self.assertEqual(status["latest_version"], "1.6.20")
+            with open(wb_settings.settings_path(d), encoding="utf-8") as fh:
+                raw = fh.read()
+        self.assertNotIn(token, raw)
+
+
 class BackgroundWorkerTests(unittest.TestCase):
     def test_the_worker_is_a_daemon_and_stops_promptly(self):
         with tempfile.TemporaryDirectory(prefix="upd-bg-") as d:
@@ -361,11 +452,17 @@ class RouteTests(unittest.TestCase):
         _handle_settings_save = proxy.Handler._handle_settings_save
         _get_updates = proxy.Handler._get_updates
         _route_update_check = proxy.Handler._route_update_check
+        _route_update_install = proxy.Handler._route_update_install
 
         def __init__(self, payload=None):
             self.payload = payload
             self.status = None
             self.reply = None
+            self.server = self._FakeServer()
+
+        class _FakeServer(object):
+            server_address = ("127.0.0.1", 8788)
+            server_port = 8788
 
         def _payload_or_error(self, allow_list=False):
             return self.payload
@@ -448,6 +545,32 @@ class RouteTests(unittest.TestCase):
             self.assertEqual(request.reply["latest_version"], "1.6.18")
             self.assertTrue(request.reply["update_available"])
             self.assertEqual(len(fetcher.calls), 1)
+
+    def test_manual_install_queues_only_the_checked_newer_release(self):
+        with tempfile.TemporaryDirectory(prefix="upd-install-route-") as d:
+            worker = checker(d, FakeFetcher([release("v1.6.18")]))
+            worker.check(manual=True)
+            with mock.patch.object(proxy, "UPDATES", worker), \
+                    mock.patch.object(proxy.wb_update_request, "request_install",
+                                      return_value={"state": "queued", "version": "1.6.18"}) as queue:
+                request = self.Request()
+                request._route_update_install()
+            self.assertEqual(request.status, 202)
+            self.assertIs(request.reply["ok"], True)
+            self.assertEqual(request.reply["version"], "1.6.18")
+            args, kwargs = queue.call_args
+            self.assertEqual(args, ("v1.6.18", CURRENT))
+            self.assertEqual(kwargs.get("port"), 8788)
+            self.assertFalse(kwargs.get("lan"))
+
+    def test_manual_install_refuses_when_no_new_release_was_checked(self):
+        with tempfile.TemporaryDirectory(prefix="upd-install-none-") as d:
+            worker = checker(d, FakeFetcher([]))
+            with mock.patch.object(proxy, "UPDATES", worker):
+                request = self.Request()
+                request._route_update_install()
+            self.assertEqual(request.status, 409)
+            self.assertFalse(request.reply["ok"])
 
     def test_the_status_route_still_answers_without_a_worker(self):
         with tempfile.TemporaryDirectory(prefix="upd-route-") as d:
