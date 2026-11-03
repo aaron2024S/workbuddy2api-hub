@@ -2,6 +2,7 @@ import re
 import base64
 import datetime
 import json
+import math
 import os
 import random
 import ssl
@@ -753,6 +754,13 @@ DEGRADE_COOLDOWN_MAX = 7200.0   # ... doubling up to 2 hours
 # 与其它冷却不同，这个期限是**持久化**的（见 note_restricted）。
 RESTRICTED_ACCOUNT_COOLDOWN = 7200.0
 
+# 临期积分优先的权重放大系数。_expiry_weight() 算出的乘积（紧迫度 × 剩余量，
+# 约 1.0–5.5）乘上它再取整，让相邻档位之间留出足够的分辨率：不放大时
+# round() 会把一整段天数压成同一个整数，权重就失去区分度（实测生产池 110 个
+# 账号权重全部相同，退化成纯轮询）。取 10 表示最急的账号大约拿到最不急的
+# 5 倍流量，而不是独占。
+EXPIRY_WEIGHT_SCALE = 10.0
+
 
 def _exponential_backoff(count, base, cap, offset):
     """base * 2 ** (count - offset), clamped to cap and to 20 steps."""
@@ -995,6 +1003,16 @@ class Account(object):
         # otherwise a single throttled model blackholes every request on the pool.
         # Deliberately runtime-only (not persisted): see VOLATILE_FIELDS.
         self.model_cooldowns = {}
+        # 「这条冷却是上游判定额度用满（6004）」的标记：模型 -> 撞线时刻。
+        # 与 model_cooldowns 同款运行时态（重启即清零），但窗口探针会把
+        # 事实落在 accounts/model_windows.json 里，重启后由
+        # restore_window_cooldowns() 连同冷却一起挂回来（issue #668）。
+        #
+        # 为什么单独一张表：凭证档的 model_caps 只覆盖免费模型（限额联动的
+        # 范围），收费模型撞 6004 一样是"配额用尽"，但它不写 model_caps，
+        # 于是面板把它显示成"429 临时限流（60s~10m 的短窗口）"，而真实恢复
+        # 时刻在 20 小时以后。
+        self.model_cap_marks = {}
         # 每个模型冷却窗口是**什么时候挂上的**（model -> epoch）。model_cooldowns
         # 只留恢复时刻，起始时刻以前被丢掉：面板因此无法如实说「限流时刻」，只能
         # 用「—」占位，把 60s 的短时 parking 和几小时的 6004 撞线画成一样。与
@@ -1091,9 +1109,9 @@ class Account(object):
         # AccountPool.apply_daily_credit_limit(); 0 disables the guard.
         self.daily_credit_limit = 0
         self.daily_credits_today = None
-        # The realm's free model ids, pushed by the same apply call. Empty
-        # until then, and an unknown model counts as paid, so the guard
-        # fails closed instead of leaking spend through unseen names.
+        # The realm's free model ids, pushed by the daily-credit and reserve
+        # apply calls. Empty until then, and an unknown model counts as paid,
+        # so both guards fail closed instead of leaking spend through unseen ids.
         self.free_models = frozenset()
         # Per-model daily guard: once ONE model burned the configured tokens
         # today the account stops being handed out for that model only -
@@ -1193,8 +1211,22 @@ class Account(object):
                 entry["startedAt"] = int(started)
             # 撞线时间只在 cap 还在恢复期内时带上：它同时说明这次禁用是
             # 「额度用满」（6004）而不是一次临时限流，面板据此显示两段时间。
+            #
+            # 两个来源：凭证档的 model_caps（免费模型，限额联动范围内），以及
+            # 运行时/窗口探针记下的 model_cap_marks（任何模型，含国内版按积分
+            # 计费的 deepseek-v4.1-flash）。后者补上的是"付费模型撞 6004"这个
+            # 事实——不补的话面板只能写成"临时限流（60s~10m）"，而真实恢复
+            # 时刻在 20 小时以后（issue #668）。
+            capped_at = 0
             if self.cap_until(model, now) > 0:
-                entry["cappedAt"] = int(self.model_caps[model]["at"])
+                capped_at = int(self.model_caps[model]["at"])
+            else:
+                try:
+                    capped_at = int(self.model_cap_marks.get(model) or 0)
+                except (TypeError, ValueError):
+                    capped_at = 0
+            if capped_at:
+                entry["cappedAt"] = capped_at
             models.append(entry)
         return error, deadline, models, detail, restricted
 
@@ -1254,6 +1286,7 @@ class Account(object):
             # 账号档位（#505）：面板在「会员类型」旁显示包名与读取时刻。
             "tier": self.tier,
             "reserveCredits": int(self.reserve_credits or 0),
+            # Account-level state, even while an explicitly free model serves.
             "reserveBlocked": self.reserve_blocked(),
             "dailyTokenLimit": int(self.daily_token_limit or 0),
             "dailyTokensToday": (int(self.daily_tokens_today)
@@ -1362,14 +1395,18 @@ class Account(object):
         if self.path and os.path.exists(self.path):
             os.remove(self.path)
 
-    def reserve_blocked(self):
-        """True when the low-credit guard should keep this account idle.
+    def reserve_blocked(self, model=None):
+        """True when the low-credit guard should keep this account off `model`.
 
         Only a *known* balance can block: an account whose credits were never
         fetched stays usable, otherwise a fresh install would look empty.
+        A positive reserve exempts models the realm catalogue marks free;
+        paid, unknown, and model-less calls retain the account-level guard.
         """
         reserve = int(self.reserve_credits or 0)
         if reserve <= 0:
+            return False
+        if model and self.model_is_free(model):
             return False
         credits = self.credits
         if not isinstance(credits, dict):
@@ -1467,6 +1504,43 @@ class Account(object):
             if soonest is None or days < soonest:
                 soonest = float(days)
         return soonest
+
+    def soonest_expiring_remain(self):
+        """How many credits the soonest-lapsing package still holds.
+
+        The companion of `soonest_expiring_days()`: that one says *when* the
+        first package lapses, this one says *how much* is still unspent in it.
+        Both come from the same package, so the weight in `_expiry_weight()`
+        multiplies urgency by the amount actually at risk of being wasted.
+
+        None when nothing can be said - no credit data, no package with a
+        usable remainder, or no end date - which keeps an unjudgeable account
+        on weight 1 instead of guessing.
+        """
+        credits = self.credits
+        if not isinstance(credits, dict):
+            return None
+        soonest = None
+        remain_of_soonest = None
+        for package in (credits.get("packages") or []):
+            if not isinstance(package, dict):
+                continue
+            if package.get("no_expiry"):
+                continue
+            if package.get("package_code") == "enterprise":
+                continue
+            if package.get("is_expired"):
+                continue
+            days = package.get("days_left")
+            remain = package.get("remain")
+            if not isinstance(days, (int, float)) or days < 0:
+                continue
+            if not isinstance(remain, (int, float)) or remain <= 0:
+                continue
+            if soonest is None or days < soonest:
+                soonest = float(days)
+                remain_of_soonest = float(remain)
+        return remain_of_soonest
 
     def in_expiring_window(self):
         """True when this account should jump the dispatch queue.
@@ -1656,6 +1730,49 @@ class Account(object):
                 out.add(mid)
         return out
 
+    def model_cooldown_until(self, model=None):
+        """这个模型当前的冷却截止时刻（没有冷却则 0）。"""
+        if not model:
+            return 0.0
+        try:
+            return float((self.model_cooldowns or {}).get(model, 0.0))
+        except (AttributeError, TypeError, ValueError):
+            return 0.0
+
+    def blocked_by_model_cooldown(self, model=None, now=None):
+        """这个账号此刻是不是"只因为这个模型还在上游限流窗口里"而不可用。
+
+        模型冷却是上游自己的回答："这个模型的窗口用满了，到 T 重置"。凭证本身
+        没问题，账号池也没有坏，只是在等。因此池级报错要说清"在等什么、等到
+        什么时候"，而不是报成"没有可用账号"（issue #665）。
+
+        判定与 `ready()` 同序（人工黑名单 → 档位 → 余额保留 → 日限额 → 积分
+        限额 → 模型日限额），只是把"临期凭证"那条排除在外：刷新是网络动作，
+        这条判断要保持只读。
+        """
+        now = time.time() if now is None else now
+        if not model:
+            return False
+        if self.model_cooldown_until(model) <= now:
+            return False
+        if not self.enabled or not self.access_token \
+                or getattr(self, "token_expired", False):
+            return False
+        if self.model_disabled(model):
+            return False
+        if (not getattr(self, "is_paid_user", False)
+                and wb_tiers.requires_pro(model, self.realm)):
+            return False
+        if self.reserve_blocked():
+            return False
+        if self.daily_limit_blocked():
+            return False
+        if self.credit_limit_blocked(model):
+            return False
+        if self.model_token_limit_blocked(model):
+            return False
+        return True
+
     def unavailable_reason(self, model=None):
         """这个账号此刻为什么接不了单；可用时返回空字符串。
 
@@ -1698,7 +1815,7 @@ class Account(object):
             elif label.startswith("模型") and self.unscoped_streak > 1:
                 streak = "（连续第 %d 次）" % self.unscoped_streak
             return "%s 剩余 %s%s" % (label, _human_left(until - now), streak)
-        if self.reserve_blocked():
+        if self.reserve_blocked(model):
             return "余额低于保留线"
         if self.daily_limit_blocked():
             return "今日 Token 额度用尽"
@@ -1722,7 +1839,7 @@ class Account(object):
             return False
         return str(model).strip().lower() in self.disabled_models
 
-    def ready(self, model=None):
+    def ready(self, model=None, refresh=True):
         if not self.enabled or not self.access_token or getattr(self, "token_expired", False):
             return False
         # 人工黑名单排在最前：它是静态配置（最便宜），而且在语义上优先于所有
@@ -1738,9 +1855,9 @@ class Account(object):
             return False
         if self.throttle_wait(model=model) > 0:
             return False
-        # Parked below the reserve: serving a request here is what would push
-        # the balance to zero and trigger the upstream reminder SMS.
-        if self.reserve_blocked():
+        # A positive reserve stops paid requests below the floor; catalogue-
+        # free models cannot spend the balance this guard protects.
+        if self.reserve_blocked(model):
             return False
         # Today's token budget is spent: keep the seat for tomorrow instead
         # of letting the upstream answer 429 for the rest of the day.
@@ -1765,7 +1882,14 @@ class Account(object):
             # Returning True unconditionally here kept handing out an account
             # whose token was about to expire, so requests went upstream with a
             # stale credential and came back 401/403.
+            if not refresh:
+                # 只读口径（/health 的按模型统计）：不发起刷新，也不把"快到期"
+                # 算成不可用。刷新是网络动作，探针不该因它抖动，也不该把一
+                # 次失败放大成每个模型一次重试。
+                return True
             return self.refresh()
+        if not refresh:
+            return True
         return self.refresh()
 
     def is_cli_identity(self):
@@ -1773,11 +1897,13 @@ class Account(object):
         return self.product == wb_identity.PRODUCT_CLI
 
     def headers(self, purpose="chat", session_key=None, turn_request_id=None,
-                model=None, conversation_id=None):
+                model=None, conversation_id=None, media_identity=None):
         """组出这一轮的出站标头。
 
         chat 用途走 wb_identity（CLI 头 / WorkBuddy 头 / VSCode 头，可切换）；
-        billing 用途维持原本的轻量标头，计费端点不吃那套身分。
+        billing 用途维持原本的轻量标头，计费端点不吃那套身分；media 用途复用
+        chat 那份身分再加三个媒体端点特有的头（生图 / 生视频的 /v2/images/*、
+        /v2/videos/*），见该分支里的注释。
 
         `model` / `conversation_id` 只对 chat 用途有意义：官方 VSCode 扩展在
         model 请求上带 `X-Model-ID`（值就是本次 model），`X-Conversation-ID`
@@ -1809,6 +1935,57 @@ class Account(object):
         cfg = get_realm_config(self.realm)
 
         if purpose != "chat":
+            if purpose == "media":
+                # 媒体端点（/v2/images/*、/v2/videos/*）的出站标头。
+                #
+                # 组法：直接复用本账号 chat 那份身分（build_identity_headers，与
+                # chat 分支同一个函数），再补三个媒体端点要的头。理由两条：
+                #   1) 同一个客户端发的所有请求，头形状一致最自然；chat 已经在同一
+                #      个 host（copilot.tencent.com / www.workbuddy.ai）上稳定 200；
+                #   2) dsh 插件的 imageHeaders 是拿 **CLI 身份**的账号实测出来的，
+                #      本仓库账号是桌面身份（product=workbuddy），照抄它的 UA 反而
+                #      是猜测。要切到 CLI 形状就把 media_identity="cli" 传进来，
+                #      P0 取证之后由配置决定默认值，不用改这里。
+                #
+                # 差异只有三处，都是媒体端点特有的：Accept 用列表形态、补
+                # X-Requested-With、补企业标识（chat 的桌面分支不发 X-Enterprise-Id）。
+                # 刻意**不带** Origin / Referer：dsh 的取证探针就是不带这两个头拿到
+                # 200 的，多带两个头只多一个可能被网关拒掉的变量，没有收益。
+                product = wb_identity.normalize_product(
+                    media_identity or self.product)
+                headers = {
+                    "Content-Type": "application/json",
+                    "Accept": "application/json, text/plain, */*",
+                    "X-Requested-With": "XMLHttpRequest",
+                }
+                headers.update(wb_identity.build_identity_headers(
+                    product=product,
+                    realm=self.realm,
+                    uid=self.uid,
+                    token=self.access_token,
+                    enterprise_id=self.enterprise_id,
+                    tenant_id=self.enterprise_id,
+                    private_data=(wb_settings.identity_private_data(
+                        os.path.dirname(self.path)) if self.path else "auto"),
+                ))
+                if self.enterprise_id:
+                    headers["X-Enterprise-Id"] = self.enterprise_id
+                    headers["X-Tenant-Id"] = self.enterprise_id
+                else:
+                    headers["X-No-Enterprise-Id"] = "1"
+                if self.realm == "cn":
+                    headers["X-Product"] = "SaaS"
+                if self.is_api_key:
+                    # 与 chat / billing 两条路口径一致：静态 Key 两个鉴权头都发。
+                    headers["X-API-Key"] = self.access_token
+                # 国内版才发设备 token（国际版客户端本来就没有这个头，见 #448）；
+                # CLI 身份全包没有设备 token 逻辑。
+                device_token = (self._device_token()
+                                if self.realm == "cn" and not self.is_cli_identity()
+                                else "")
+                if device_token:
+                    headers["X-Device-Token"] = device_token
+                return headers
             headers = {
                 "Content-Type": "application/json",
                 "Accept": "application/json, text/plain, */*",
@@ -2021,6 +2198,12 @@ class Account(object):
 
     def can_daily_chat(self):
         if self.realm != "intl":
+            return False
+        # 403 / code 11140 is an account-level restriction. Scheduled daily
+        # activity must respect the same persisted restriction window as normal
+        # chat dispatch, otherwise every later activity slot probes the account
+        # again even though the upstream already told us to stop.
+        if self.restricted_until > time.time():
             return False
         if not self.last_daily_chat:
             return True
@@ -2575,6 +2758,11 @@ class Account(object):
         """
         if self.realm != "intl":
             return {"ok": False, "error": "daily chat is only for international accounts"}
+        # 11140 的限制窗口要和普通 chat 一样先挡住；这里单独返回失败形状，
+        # 不能把「账号受限」伪装成「今日活跃已完成」。
+        if self.restricted_until > time.time():
+            return {"ok": False, "skipped": True, "restricted": True,
+                    "error": "账号处于上游风控限制窗口，跳过每日活跃"}
         # 当日活跃成功后再触发（下一个定时点、手动补跑、并发重复调度）直接
         # 跳过，连桌面腿也不发：这一天的 30/50 积分已经拿到了。
         if not self.can_daily_chat():
@@ -2676,6 +2864,22 @@ class Account(object):
                 err = exc.read().decode("utf-8", "replace")
             except Exception:
                 err = str(exc)
+            # Normal chat already treats 403/code 11140 as an account-level
+            # restriction and persists restrictedUntil. Daily activity used to
+            # bypass that path and therefore retried the same restricted account
+            # at later scheduler slots. Mirror the existing governance here.
+            upstream_code = None
+            try:
+                body = json.loads(err or "{}")
+                upstream_code = body.get("code") if isinstance(body, dict) else None
+            except Exception:
+                pass
+            if exc.code == 403 and upstream_code == 11140:
+                self.note_restricted(detail=err)
+                if self.path and os.path.exists(os.path.dirname(self.path)):
+                    self.save(os.path.dirname(self.path))
+                return {"ok": False, "restricted": True,
+                        "error": f"HTTP 403 / 11140: {err[:100]}"}
             return {"ok": False, "error": f"HTTP {exc.code}: {err[:100]}"}
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
@@ -3655,6 +3859,41 @@ def _human_delta(seconds):
     return "%d min" % int(seconds / 60)
 
 
+AUTH_CHALLENGE_MARK = "www-authenticate: "
+
+
+def auth_challenge(headers):
+    """The `WWW-Authenticate` value of a 401, whitespace-collapsed and bounded.
+
+    Gateways such as APISIX answer a dead token with an HTML page whose reason
+    lives only in this header (`Bearer realm="copilot", error="invalid_token"`).
+    Reading it is what separates "the credential is bad" from "a proxy page
+    answered", which the body alone cannot tell apart.
+    """
+    try:
+        value = headers.get("www-authenticate") if headers else ""
+    except Exception:
+        return ""
+    return " ".join(str(value or "").split())[:160]
+
+
+def http_error_message(exc, detail, limit=None):
+    """Diagnosis string for an HTTPError: `HTTP <code>: <body>`, plus the challenge.
+
+    The challenge goes *before* the body on purpose. Callers truncate the label
+    (80/150 chars) and `note_error` keeps only 200, so a header appended at the
+    end would be the first thing cut - exactly the evidence that matters.
+    """
+    body = str(detail or "")
+    if limit:
+        body = body[:limit]
+    code = getattr(exc, "code", "")
+    challenge = auth_challenge(getattr(exc, "headers", None))
+    if not challenge:
+        return "HTTP %s: %s" % (code, body)
+    return "HTTP %s (%s%s): %s" % (code, AUTH_CHALLENGE_MARK, challenge, body)
+
+
 def _auth_failure_text(text):
     """True for a credential-shaped 401, not an intermediate proxy page.
 
@@ -3662,12 +3901,20 @@ def _auth_failure_text(text):
     that the token is dead: parking the account on it would take a healthy
     credential out of rotation until a manual re-login (#435). Only mark the
     account when the failure itself names authorization.
+
+    RFC 6750 `error="invalid_token"` is such a naming, and it outranks the HTML
+    bail-out: APISIX (copilot.tencent.com) rejects a dead token with an HTML
+    page and puts the reason in `WWW-Authenticate`, so the body alone looks
+    exactly like a proxy page while the header says the credential is bad.
+    `http_error_message()` keeps that header in the diagnosis string.
     """
     lower = str(text or "").lower()
+    if "invalid_token" in lower or "invalid-token" in lower:
+        return True
     if "<html" in lower:
         return False
     return ("401" in lower or "unauthorized" in lower or "authorization" in lower
-            or "token expired" in lower or "invalid_token" in lower)
+            or "token expired" in lower)
 
 
 def _human_left(seconds):
@@ -4053,6 +4300,16 @@ class AccountPool(object):
                     continue
                 if account.arm_model_cooldown(model, row.get("reset_at")):
                     restored.setdefault(uid, []).append(model)
+                # 这条窗口是上游判定额度用满（6004）时，把撞线时刻一起挂回来：
+                # 面板据此显示"配额耗尽"而不是"临时限流"，重启后也不丢这个
+                # 事实（凭证档的 model_caps 只覆盖免费模型，issue #668）。
+                if row.get("cap"):
+                    try:
+                        cap_at = float(row.get("cap_at") or 0.0)
+                    except (TypeError, ValueError):
+                        cap_at = 0.0
+                    if cap_at:
+                        account.model_cap_marks[model] = cap_at
         for uid, mids in sorted(restored.items()):
             self.log("account %s: 模型 %s 仍在上游限流窗口内（重启后按窗口恢复）"
                      % (uid[:8], ", ".join(mids)))
@@ -4279,7 +4536,7 @@ class AccountPool(object):
                 else:
                     account.proxy = account.proxy_legacy
 
-    def apply_reserve_credits(self, values=None):
+    def apply_reserve_credits(self, values=None, free_models=None):
         """Re-resolve the low-credit guard for every account.
 
         Same shape as apply_proxy_slots(): settings.json is the source of
@@ -4287,7 +4544,8 @@ class AccountPool(object):
         needs no extra settings lookup. `values` is the guard resolved per
         realm ({"global": g, "intl": ..., "cn": ...}); each account picks its
         own realm, so a per-realm override lands only on that realm's accounts
-        while the global default keeps covering both.
+        while the global default keeps covering both. `free_models` is the
+        caller's realm -> free-id catalogue view; None retains the last one.
         """
         import wb_settings
 
@@ -4296,6 +4554,9 @@ class AccountPool(object):
         with self._lock:
             for account in self.accounts:
                 account.reserve_credits = _realm_limit(values, account.realm)
+                if free_models is not None:
+                    account.free_models = frozenset(
+                        free_models.get(account.realm) or ())
         return values
 
     def apply_expiring_window(self, values=None):
@@ -4485,11 +4746,19 @@ class AccountPool(object):
             return [a for a in self.accounts
                     if (not realm or a.realm == realm) and a.task_active()]
 
-    def count_ready(self, realm=None, model=None, allowed=None):
+    def count_ready(self, realm=None, model=None, allowed=None, refresh=True):
+        """How many accounts can serve right now.
+
+        `refresh=False` keeps the count read-only: `Account.ready()` normally
+        refreshes a credential that is about to expire, and a probe that asks
+        "how many accounts are left" must not turn into a network call per
+        model (issue #667).
+        """
         with self._lock:
             snapshot = [a for a in self.accounts if not realm or a.realm == realm]
         return sum(1 for a in snapshot
-                   if a.enabled and a.access_token and a.ready(model=model)
+                   if a.enabled and a.access_token
+                   and a.ready(model=model, refresh=refresh)
                    and (allowed is None or a.uid in allowed))
 
     def pick_for_session(self, realm=None, session_key=None, exclude=None, model=None,
@@ -4621,18 +4890,47 @@ class AccountPool(object):
     def _expiry_weight(self, account):
         """How much of the window's traffic this account should take.
 
-        Linear in how close the credits are to lapsing, floored at 1 so an
-        account at the far edge of the window still gets served rather than
-        starved until the others run dry.
+        Two factors, multiplied, floored at 1 so an account at the far edge of
+        the window still gets served rather than starved until the others run
+        dry:
+
+          * urgency - how close the soonest-lapsing package is. Kept as a
+            fraction of the window rather than a rounded day count, because
+            rounding collapsed the whole 0-1.4 day range onto one weight and
+            that is exactly where a real pool sits: on the live pool 110 of
+            112 accounts reported days_left 0.10 and every one of them got the
+            same weight, so the preference degraded into a plain rotation.
+
+          * amount - how much of the lapsing package is still unspent. This is
+            the part that actually gets "spent before it expires": an account
+            holding 30 expiring credits is worth 30x the traffic of one holding
+            1, and the old weight ignored the figure entirely. Logarithmic, so
+            a 30-vs-1 gap does not turn into a 30x share that starves everyone
+            else, and floored at 1 so a nearly-spent package still counts.
+
+        A pool where nobody can be judged keeps the plain rotation: an unknown
+        soonest-expiring day yields weight 1, and equal weights degenerate to
+        a plain rotation in `_smooth_weighted_pick`.
         """
         try:
-            window = int(account.expiring_window_days or 0)
+            window = float(account.expiring_window_days or 0)
         except (TypeError, ValueError):
-            window = 0
+            window = 0.0
         days = account.soonest_expiring_days()
         if days is None:
             return 1
-        return max(1, int(round(window - days)) + 1)
+        # urgency: 1 at the far edge of the window, growing to ~1+1/scale at 0
+        if window <= 0:
+            return 1
+        remaining_fraction = max(0.0, min(1.0, 1.0 - (float(days) / window)))
+        urgency = 1.0 + remaining_fraction
+        # amount: log-scaled so 30 credits is not a 30x share of the traffic
+        amount = account.soonest_expiring_remain()
+        if amount is None or amount <= 0:
+            amount_weight = 1.0
+        else:
+            amount_weight = 1.0 + math.log10(1.0 + float(amount))
+        return max(1, int(round(urgency * amount_weight * EXPIRY_WEIGHT_SCALE)))
 
     def _pick_remaining_first(self, snapshot, exclude, model):
         """剩余估算接近耗尽的 (账号, 模型) 优先接单，或 None（没有可交的）。

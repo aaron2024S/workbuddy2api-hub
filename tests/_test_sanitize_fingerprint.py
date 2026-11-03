@@ -309,6 +309,124 @@ class IdentityVerbVariantsTests(unittest.TestCase):
         self.assertEqual(out[2]["content"], fp)
 
 
+class DshFileReferenceParagraphTests(unittest.TestCase):
+    """DSH 系统提示里「@ 文件引用说明段」的渠道指纹。
+
+    DeepSeek Harness 的官方插件 `@deepseek-ai/dsh-file-reference`
+    （packages/context/file-reference）会往系统提示里注入 FILE_REFERENCE_PROMPT。
+    这一段被上游当成「非官方客户端」的特征，回 400 / code 11-128
+    （displayTips：这次调用没通过渠道校验）。
+
+    2026-10-28 在本机 CN 号池实测，用来定指纹边界（不是猜）：
+
+        · 只发 A+B 两句 → 200
+        · 整段五句连排 → 400，稳定复现
+        · 整段里 A 句补一个 `that` → 200
+
+    也就是说匹配单位是**整段连续文本**：截前两句测会误判成「已修复」，
+    改 A 句一个词就能让它失配。修法因此取最小改动——只在 A 句补一个 `that`，
+    一个词不多不少，B 句及其后所有句子原样保留，语义完全不变；负向前瞻
+    (?!that ) 保证幂等。作用域与 GUI 段同口径：system / developer / assistant，
+    user / tool 里的同句属用户数据不改写（#537）。
+    """
+
+    A = "Tokens prefixed with @ are paths the user explicitly referenced."
+    A_FIXED = "Tokens prefixed with @ are paths that the user explicitly referenced."
+    B = ("Relative paths resolve from the workspace root; absolute paths identify "
+         "files or directories on the host.")
+    TAIL = (" A trailing slash marks a directory: list it when its contents matter. "
+            "Anything else is a file: use the read tool when its contents are needed, "
+            "and do not claim to have inspected it before reading. "
+            "@\"...\" quotes a path containing spaces.")
+    PARA = A + " " + B + TAIL
+    PARA_FIXED = A_FIXED + " " + B + TAIL
+
+    def test_full_paragraph_rewritten(self):
+        self.assertEqual(P.sanitize_text(self.PARA), self.PARA_FIXED)
+
+    def test_only_sentence_a_changes(self):
+        # B 句及其后所有句子必须逐字保留：改的是措辞，不是内容。
+        out = P.sanitize_text(self.PARA)
+        self.assertIn(self.B + self.TAIL, out)
+        self.assertNotIn(" are paths the user ", out)
+
+    def test_idempotent(self):
+        once = P.sanitize_text(self.PARA)
+        self.assertEqual(P.sanitize_text(once), once)
+        self.assertFalse(P.has_fingerprint(once))
+
+    def test_sentence_a_alone_rewritten(self):
+        # A 句单独出现时改写同样安全（只补一个词），不必等 B 句在场；
+        # 这样 DSH 换掉后半段措辞也不会让规则失效。
+        self.assertEqual(P.sanitize_text(self.A), self.A_FIXED)
+
+    def test_case_insensitive(self):
+        self.assertEqual(P.sanitize_text(self.PARA.lower()), self.PARA_FIXED.lower())
+
+    def test_embedded_in_system_prompt(self):
+        text = "You are a coding agent.\n\n" + self.PARA + "\n\nMore rules follow."
+        self.assertEqual(
+            P.sanitize_text(text),
+            "You are a coding agent.\n\n" + self.PARA_FIXED + "\n\nMore rules follow.")
+
+    def test_scoped_to_system_developer_and_assistant(self):
+        out = P.sanitize_messages([
+            {"role": "system", "content": self.PARA},
+            {"role": "developer", "content": self.PARA},
+            {"role": "assistant", "content": self.PARA},
+            {"role": "user", "content": self.PARA},
+            {"role": "tool", "content": self.PARA},
+        ])
+        for i in range(3):
+            self.assertEqual(out[i]["content"], self.PARA_FIXED, out[i]["role"])
+        # user / tool 里的同句是用户数据，改写会让模型看到与磁盘不一致的内容。
+        self.assertEqual(out[3]["content"], self.PARA)
+        self.assertEqual(out[4]["content"], self.PARA)
+
+    def test_unrelated_at_paths_untouched(self):
+        for text in ("mail me at foo@bar.com", "npm i @deepseek-ai/dsh",
+                     "see C:\\work\\@cache for details"):
+            self.assertEqual(P.sanitize_text(text), text)
+
+
+class CodexIntroFingerprintTests(unittest.TestCase):
+    """Codex 基础提示词首段（#743）。
+
+    旧规则把中性句改写成 ``You are a coding agent running in the Codex CLI
+    tool, ...``，而 ``SANITIZE_FEATURES`` 恰好在找 ``... running in the Codex
+    CLI``，于是 sanitize 之后 has_fingerprint() 仍为 True，出站 body 继续
+    11-128。这里钉住两件事：首段必须被中性化；改写必须是幂等的。
+    """
+
+    INTRO = ("You are a coding agent running in the Codex CLI, a terminal-based "
+             "coding assistant.")
+    INTRO_TOOL = ("You are a coding agent running in the Codex CLI tool, a "
+                  "terminal-based coding assistant.")
+    CLEAN = "You are a helpful AI assistant."
+
+    def test_codex_intro_is_neutralized(self):
+        for text in (self.INTRO, self.INTRO_TOOL):
+            self.assertTrue(P.has_fingerprint(text))
+            self.assertEqual(P.sanitize_text(text), self.CLEAN, text)
+            self.assertFalse(P.has_fingerprint(P.sanitize_text(text)))
+
+    def test_embedded_after_neutral_sentence_still_matches(self):
+        # 真实 Codex base_instructions 的形态：中性首句 + 自述句 + 后续段落。
+        text = ("You are a helpful AI assistant. " + self.INTRO +
+                "\n\nYour capabilities:\n\n- Receive user prompts.")
+        out = P.sanitize_text(text)
+        self.assertFalse(P.has_fingerprint(out))
+        self.assertIn("Your capabilities:", out)
+
+    def test_neutral_sentence_is_untouched(self):
+        self.assertEqual(P.sanitize_text(self.CLEAN), self.CLEAN)
+        self.assertFalse(P.has_fingerprint(self.CLEAN))
+
+    def test_idempotent(self):
+        once = P.sanitize_text(self.INTRO)
+        self.assertEqual(P.sanitize_text(once), once)
+
+
 if __name__ == "__main__":
     unittest.main()
 
